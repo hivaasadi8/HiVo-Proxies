@@ -9,8 +9,6 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Upd
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
-
-from tester import S, LOCK, refresh_loop, retest_all if False else None
 from tester import S, LOCK, refresh_loop
 from store import STORE
 
