@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # ══════════════════════════════════════════
-#  HiVo Proxies — ربات پروکسی تلگرام
+#  HiVo Proxies — ربات پروکسی تلگرام (نسخه نهایی)
 # ══════════════════════════════════════════
+
 import asyncio, html, io, logging, os, re, threading
 from datetime import datetime
 
@@ -9,7 +10,8 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Upd
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
-from tester import S, LOCK, refresh_loop
+
+from tester import S, LOCK, refresh_loop, FORCE
 from store import STORE
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -24,13 +26,24 @@ def fa(x):
 
 ADMIN_STATE = {}
 
+# ────────── ابزارها ──────────
 def link_of(p):
     return f"https://t.me/proxy?server={p['server']}&port={p['port']}&secret={p['secret']}"
 
 def label_of(p):
     mark = "✅" if p.get("deep") else "🔌"
     name = p.get("country") or ""
-    return f"{p.get('flag','🌐')} {name} | {fa(p['latency'])}ms {mark}".strip()
+    return f"{p.get('flag', '🌐')} {name} | {fa(p['latency'])}ms {mark}".strip()
+
+def ago(dt):
+    if not dt:
+        return "—"
+    s = int((datetime.now() - dt).total_seconds())
+    if s < 60:
+        return f"{fa(s)} ثانیه پیش"
+    if s < 3600:
+        return f"{fa(s // 60)} دقیقه پیش"
+    return f"{fa(s // 3600)} ساعت پیش"
 
 def register(update):
     u = update.effective_user
@@ -58,6 +71,7 @@ async def gate(update, ctx):
                                               reply_markup=kb)
     return False
 
+# ────────── منوها و متن‌ها ──────────
 def menu_text():
     wel = STORE.data["settings"].get("welcome", "").strip()
     deep = sum(1 for p in S["good"] if p.get("deep"))
@@ -72,16 +86,6 @@ def menu_text():
         "",
         "「 عدد بفرست — با یک لمس اضافه می‌شود 」",
     ])
-
-def ago(dt):
-    if not dt:
-        return "—"
-    s = int((datetime.now() - dt).total_seconds())
-    if s < 60:
-        return f"{fa(s)} ثانیه پیش"
-    if s < 3600:
-        return f"{fa(s // 60)} دقیقه پیش"
-    return f"{fa(s // 3600)} ساعت پیش"
 
 def main_menu(is_admin=False):
     rows = [[InlineKeyboardButton("👑 اختصاصی", callback_data="premium"),
@@ -102,7 +106,7 @@ def stats_text():
     rate = f"{fa(round(len(g) * 100 / S['tested']))}٪" if S["tested"] else "—"
     src = STORE.data["sources"]
     top = "\n".join(
-        f"  {fa(i)}. {p.get('flag','🌐')} {html.escape(p.get('country') or p['server'])} — {fa(p['latency'])}ms"
+        f"  {fa(i)}. {p.get('flag', '🌐')} {html.escape(p.get('country') or p['server'])} — {fa(p['latency'])}ms"
         for i, p in enumerate(g[:5], 1)) or "  —"
     return (
         "📊 <b>آمار</b> — 「 اعداد دروغ نمی‌گویند 」\n"
@@ -127,6 +131,7 @@ def help_text(is_admin=False):
         t += "\n\n👑 <b>ادمین:</b> /admin"
     return t
 
+# ────────── ارسال پروکسی ──────────
 async def send_proxies(message, n):
     g = list(S["good"])
     if not g:
@@ -134,7 +139,7 @@ async def send_proxies(message, n):
         return
     items = g if (n is None or n >= len(g)) else g[:n]
     await message.chat.send_action("typing")
-    if items and n is not None and n > 20:
+    if len(items) > 20:
         content = "\n".join(link_of(p) for p in items) + "\n"
         buf = io.BytesIO(content.encode())
         await message.reply_document(buf, filename=f"HiVoProxies-{len(items)}.txt",
@@ -143,17 +148,9 @@ async def send_proxies(message, n):
                                      parse_mode=ParseMode.HTML)
         STORE.add_totals(files=1, proxies=len(items))
         return
-    first = True
-    for i in range(0, len(items), 8):
-        chunk = items[i:i + 8]
-        rows = [[InlineKeyboardButton(label_of(p), url=link_of(p))] for p in chunk]
-        if first:
-            await message.reply_html(f"⚡️ <b>{fa(len(items))} پروکسی زنده</b> — لمس کن تا اضافه شود:",
-                                     reply_markup=InlineKeyboardMarkup(rows))
-            first = False
-        else:
-            await message.reply_html("‌", reply_markup=InlineKeyboardMarkup(rows))
-        await asyncio.sleep(0.4)
+    rows = [[InlineKeyboardButton(label_of(p), url=link_of(p))] for p in items]
+    await message.reply_html(f"⚡️ <b>{fa(len(items))} پروکسی زنده</b> — لمس کن تا اضافه شود:",
+                             reply_markup=InlineKeyboardMarkup(rows))
     STORE.add_totals(files=0, proxies=len(items))
 
 async def send_premium(message):
@@ -242,6 +239,21 @@ async def cmd_admin(update, ctx):
         return
     await update.message.reply_html(admin_text(), reply_markup=admin_kb())
 
+async def cmd_stats(update, ctx):
+    register(update)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منو", callback_data="menu")]])
+    await update.message.reply_html(stats_text(), reply_markup=kb)
+
+async def cmd_help(update, ctx):
+    register(update)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منو", callback_data="menu")]])
+    await update.message.reply_html(help_text(STORE.is_admin(update.effective_user.id)), reply_markup=kb)
+
+async def cmd_cancel(update, ctx):
+    ADMIN_STATE.pop(update.effective_user.id, None)
+    await update.message.reply_html("「 برگشتی 」")
+
+# ────────── متن ورودی ──────────
 async def on_text(update, ctx):
     register(update)
     uid = update.effective_user.id
@@ -258,8 +270,9 @@ async def on_text(update, ctx):
         elif state == "premium":
             from tester import LINK_RE, TG_RE, LINE_RE
             found = []
+            clean = txt.replace("&amp;", "&")
             for rx in (LINK_RE, TG_RE):
-                for m in rx.finditer(txt.replace("&amp;", "&")):
+                for m in rx.finditer(clean):
                     found.append({"server": m.group(1), "port": int(m.group(2)),
                                   "secret": m.group(3).lower(), "name": ""})
             for m in LINE_RE.finditer(txt):
@@ -298,6 +311,7 @@ async def on_text(update, ctx):
     else:
         await cmd_start(update, ctx)
 
+# ────────── دکمه‌ها ──────────
 async def on_button(update, ctx):
     register(update)
     q = update.callback_query
@@ -306,10 +320,12 @@ async def on_button(update, ctx):
     uid = q.from_user.id
     is_admin = STORE.is_admin(uid)
     kb_menu = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منو", callback_data="menu")]])
+
     if data == "recheck":
         if await gate(update, ctx):
             await q.message.reply_html(menu_text(), reply_markup=main_menu(is_admin))
         return
+
     if data.startswith("px:"):
         if not await gate(update, ctx):
             return
@@ -330,8 +346,8 @@ async def on_button(update, ctx):
     elif data == "help":
         await q.edit_message_text(help_text(is_admin), parse_mode=ParseMode.HTML, reply_markup=kb_menu)
     elif data == "retest":
-        await q.edit_message_text("📡 「 صبر؛ کیفیت ساخته می‌شود 」", parse_mode=ParseMode.HTML)
-        await q.message.reply_html(menu_text(), reply_markup=main_menu(is_admin))
+        FORCE.set()
+        await q.edit_message_text("📡 「 دور تازه شروع شد — ۲ دقیقه صبر 」", parse_mode=ParseMode.HTML)
     elif data == "adm" and is_admin:
         await q.edit_message_text(admin_text(), parse_mode=ParseMode.HTML, reply_markup=admin_kb())
     elif data == "src:c" and is_admin:
@@ -378,10 +394,7 @@ async def on_button(update, ctx):
         STORE.set_setting("lock_on", not st.get("lock_on"))
         await q.edit_message_text(settings_text(), parse_mode=ParseMode.HTML, reply_markup=settings_kb())
 
-async def cmd_cancel(update, ctx):
-    ADMIN_STATE.pop(update.effective_user.id, None)
-    await update.message.reply_html("「 برگشتی 」")
-
+# ────────── شروع ──────────
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "🏠 آغاز"),
@@ -393,16 +406,7 @@ async def post_init(app):
 
 async def post_shutdown(app):
     STORE.save()
-
-async def cmd_stats(update, ctx):
-    register(update)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منو", callback_data="menu")]])
-    await update.message.reply_html(stats_text(), reply_markup=kb)
-
-async def cmd_help(update, ctx):
-    register(update)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منو", callback_data="menu")]])
-    await update.message.reply_html(help_text(STORE.is_admin(update.effective_user.id)), reply_markup=kb)
+    log.info("final save done")
 
 def main():
     STORE.load()
