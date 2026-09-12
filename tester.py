@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # ══════════════════════════════════════════
-#  HiVo Proxies — موتور تست MTProto دولایه
-#  TCP پینگ + دست‌دهی واقعی (req_pq → resPQ)
+#  HiVo Proxies — موتور تست ضدخرابی + انتشار فوری
 # ══════════════════════════════════════════
 import json, logging, os, re, socket, struct, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +13,10 @@ from store import STORE
 
 TCP_TIMEOUT   = 3
 MAX_TO_TEST   = 3000
-DEEP_LIMIT    = 400
+DEEP_LIMIT    = 300
 WORKERS       = 200
 DEEP_WORKERS  = 20
-DEEP_TIMEOUT  = 6
+DEEP_TIMEOUT  = 5
 REFRESH_EVERY = 900
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -25,6 +24,7 @@ log = logging.getLogger("hivo.proxies")
 
 S = {"good": [], "tcp": 0, "fetched": 0, "tested": 0, "last": None}
 LOCK = threading.Lock()
+FORCE = threading.Event()
 GEO = {}
 GEO_LOCK = threading.Lock()
 
@@ -55,7 +55,6 @@ def geo_batch(items):
             f, name = GEO.get(c["server"], ("🌐", ""))
         c["flag"], c["country"] = f, name
 
-# ──────────── جمع‌آوری ────────────
 def fetch_channel(name):
     name = str(name).strip().lstrip("@")
     name = name.replace("https://t.me/", "").replace("t.me/", "").split("/")[0]
@@ -102,7 +101,7 @@ def gather():
         try:
             items += fetch_channel(ch)
         except Exception as e:
-            log.warning(f"channel err: {e}")
+            log.warning(f"channel err: {ch} → {e}")
     uniq = {}
     for p in items:
         k = (p["server"], p["port"])
@@ -110,7 +109,6 @@ def gather():
             uniq[k] = p
     return list(uniq.values())
 
-# ──────────── تست لایه ۱: TCP ────────────
 def tcp_ping(host, port):
     try:
         t0 = time.monotonic()
@@ -125,7 +123,6 @@ def tcp_one(p):
         return None
     return {**p, "latency": ms, "flag": "🌐", "country": "", "deep": False}
 
-# ──────────── تست لایه ۲: دست‌دهی واقعی MTProto ────────────
 def deep_check(host, port, secret_hex):
     try:
         secret = bytes.fromhex(secret_hex)
@@ -134,7 +131,7 @@ def deep_check(host, port, secret_hex):
     if not secret or len(secret) < 16:
         return None
     if secret[:1] == b"\xEE":
-        return None  # fakeTLS — فقط TCP
+        return None
     if secret[:1] == b"\xDD":
         secret = secret[1:]
     secret = secret[:16]
@@ -150,7 +147,7 @@ def deep_check(host, port, secret_hex):
         s.sendall(bytes(init[:56]) + c2s.encrypt(bytes(init[56:])))
         t0 = time.monotonic()
         nonce = os.urandom(16)
-        inner = b"\x87\x07\x46\x60" + nonce  # req_pq
+        inner = b"\x87\x07\x46\x60" + nonce
         msg_id = struct.pack("<q", (int(time.time()) << 32) | 1)
         plain = b"\x00" * 8 + msg_id + struct.pack("<I", len(inner)) + inner
         frame = b"\xEF" + bytes([len(plain)])
@@ -164,7 +161,7 @@ def deep_check(host, port, secret_hex):
             if not chunk:
                 break
             buf += s2c.decrypt(chunk)
-            if b"\x63\x24\x16\x05" in buf:  # resPQ → پروکسی واقعاً زنده است
+            if b"\x63\x24\x16\x05" in buf:
                 ms = round((time.monotonic() - t0) * 1000)
                 s.close()
                 return ms
@@ -179,37 +176,49 @@ def deep_one(c):
         return None
     return {**c, "latency": ms, "deep": True}
 
-# ──────────── حلقه اصلی ────────────
+def publish(items):
+    items = sorted(items, key=lambda c: c["latency"])
+    with LOCK:
+        S["good"] = items
+        S["last"] = datetime.now()
+
 def refresh_loop():
+    log.info("refresh loop started")
     while True:
-        items = gather()
-        with LOCK:
-            S["fetched"] = len(items)
-        log.info(f"gathered: {len(items)}")
-        batch = items[:MAX_TO_TEST]
-        tcp = []
-        with ThreadPoolExecutor(WORKERS) as pool:
-            for r in pool.map(tcp_one, batch):
-                if r:
-                    tcp.append(r)
-        tcp.sort(key=lambda c: c["latency"])
-        with LOCK:
-            S["tcp"] = len(tcp)
-            S["tested"] = len(batch)
-        deep_ok = []
-        cands = [c for c in tcp if not c["secret"].startswith("ee")][:DEEP_LIMIT]
-        if cands:
-            log.info(f"deep: {len(cands)}")
-            with ThreadPoolExecutor(DEEP_WORKERS) as pool:
-                for r in pool.map(deep_one, cands):
+        try:
+            items = gather()
+            with LOCK:
+                S["fetched"] = len(items)
+            log.info(f"gathered: {len(items)}")
+            batch = items[:MAX_TO_TEST]
+            tcp = []
+            with ThreadPoolExecutor(WORKERS) as pool:
+                for r in pool.map(tcp_one, batch):
                     if r:
-                        deep_ok.append(r)
-        deep_ok.sort(key=lambda c: c["latency"])
-        deep_keys = {(c["server"], c["port"]) for c in deep_ok}
-        rest = [c for c in tcp if (c["server"], c["port"]) not in deep_keys][:200]
-        final = deep_ok + rest
-        geo_batch(final)
-        with LOCK:
-            S["good"], S["last"] = final, datetime.now()
-        log.info(f"final: {len(final)} (deep: {len(deep_ok)})")
-        time.sleep(REFRESH_EVERY)
+                        tcp.append(r)
+            tcp.sort(key=lambda c: c["latency"])
+            with LOCK:
+                S["tcp"] = len(tcp)
+                S["tested"] = len(batch)
+            log.info(f"tcp alive: {len(tcp)}")
+            geo_batch(tcp[:100])
+            publish(tcp)
+            cands = [c for c in tcp if not c["secret"].startswith("ee")][:DEEP_LIMIT]
+            deep_ok = []
+            if cands:
+                log.info(f"deep: {len(cands)}")
+                with ThreadPoolExecutor(DEEP_WORKERS) as pool:
+                    for r in pool.map(deep_one, cands):
+                        if r:
+                            deep_ok.append(r)
+            deep_ok.sort(key=lambda c: c["latency"])
+            keys = {(c["server"], c["port"]) for c in deep_ok}
+            rest = [c for c in tcp if (c["server"], c["port"]) not in keys][:200]
+            final = deep_ok + rest
+            geo_batch(final)
+            publish(final)
+            log.info(f"final: {len(final)} (deep {len(deep_ok)})")
+        except Exception as e:
+            log.exception(f"cycle error: {e}")
+        FORCE.wait(REFRESH_EVERY)
+        FORCE.clear()
