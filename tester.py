@@ -35,8 +35,12 @@ DEFAULT_SOURCES = [
     "https://t.me/s/mtprotoproxy_fast",
 ]
 
+# ── Geo cache + rate limit ──
 _GEO = {}
 _GEO_LOCK = threading.Lock()
+_GEO_RATE_LOCK = threading.Lock()
+_GEO_LAST = [0.0]
+
 _SRC_HEALTH = {}
 _H_LOCK = threading.Lock()
 
@@ -58,7 +62,10 @@ def parse_proxy(uri):
             return None
         key = host.lower() + ":" + str(port) + ":" + secret.lower()
         fp = hashlib.sha1(key.encode()).hexdigest()[:12]
-        return {"host": host, "port": port, "secret": secret, "fp": fp, "uri": uri}
+        return {
+            "host": host, "port": port, "secret": secret, "fp": fp, "uri": uri,
+            "flag": "🌐", "country": "", "city": "",
+        }
     except Exception:
         return None
 
@@ -171,25 +178,61 @@ def probe(p):
 def flag_of(cc):
     if not cc or len(cc) != 2:
         return "🌐"
-    return "".join(chr(ord(c) + 127397) for c in cc.upper())
+    try:
+        return "".join(chr(ord(c) + 127397) for c in cc.upper())
+    except Exception:
+        return "🌐"
 
 
 def geo_batch(items):
-    todo = sorted({p["host"] for p in items if p.get("host") and p["host"] not in _GEO})[:100]
-    if not todo:
+    """لوکیشن رو از ip-api میگیره. همیشه از کش سرعت میگیره."""
+    if not items:
         return
-    try:
-        r = requests.post(
-            "http://ip-api.com/batch?fields=status,country,countryCode,city,query",
-            json=todo, timeout=12)
-        for d in r.json():
-            if d.get("status") == "success":
-                with _GEO_LOCK:
-                    _GEO[d["query"]] = (flag_of(d.get("countryCode")),
-                                        d.get("country", ""),
-                                        d.get("city", ""))
-    except Exception:
-        pass
+
+    hosts_now = {p["host"] for p in items if p.get("host")}
+    with _GEO_LOCK:
+        missing = [h for h in hosts_now if h not in _GEO]
+
+    if missing:
+        # فقط 100 تا در هر درخواست
+        todo = missing[:100]
+        # rate limit: 15 req/min → 4s
+        with _GEO_RATE_LOCK:
+            now = time.time()
+            wait = 4.2 - (now - _GEO_LAST[0])
+            if wait > 0:
+                time.sleep(wait)
+            _GEO_LAST[0] = time.time()
+
+        try:
+            r = requests.post(
+                "http://ip-api.com/batch?fields=status,country,countryCode,city,query",
+                json=todo, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    for idx, d in enumerate(data):
+                        if idx < len(todo):
+                            q = d.get("query") or todo[idx]
+                        else:
+                            q = todo[idx] if idx < len(todo) else None
+                        if not q:
+                            continue
+                        if d.get("status") == "success":
+                            with _GEO_LOCK:
+                                _GEO[q] = (flag_of(d.get("countryCode")),
+                                           d.get("country", ""),
+                                           d.get("city", ""))
+                        else:
+                            # کش میکنیم که دوباره سوال نکنیم
+                            with _GEO_LOCK:
+                                _GEO[q] = ("🌐", "", "")
+            else:
+                log.warning("geo http " + str(r.status_code))
+        except Exception as e:
+            log.warning("geo: " + str(e))
+
+    # همیشه از کش خونده میشه
     for p in items:
         with _GEO_LOCK:
             f, n, c = _GEO.get(p["host"], ("🌐", "", ""))
@@ -289,6 +332,7 @@ def cycle(n_max, label):
 
     alive = []
     done = 0
+    last_pub = 0
     with ThreadPoolExecutor(WORKERS) as pool:
         futs = [pool.submit(probe, p) for p in parsed]
         for fut in as_completed(futs):
@@ -296,15 +340,23 @@ def cycle(n_max, label):
             if r:
                 alive.append(r)
             done += 1
-            if done % 100 == 0:
-                with LOCK:
-                    S["tested"] = done
-                publish(alive)
-        with LOCK:
-            S["tested"] = done
+            with LOCK:
+                S["tested"] = done
 
-    geo_batch(alive)
-    publish(alive)
+            # هر 50 تای زنده جدید، geo + publish
+            if len(alive) - last_pub >= 50:
+                geo_batch(alive)
+                publish(alive)
+                last_pub = len(alive)
+            elif done % 200 == 0:
+                # هر 200 تست هم یه بار آپدیت
+                geo_batch(alive)
+                publish(alive)
+
+    # پایان چرخه
+    if alive:
+        geo_batch(alive)
+        publish(alive)
     log.info("[" + label + "] alive: " + str(len(S["good"])))
 
     try:
