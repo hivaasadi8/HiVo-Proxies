@@ -505,7 +505,7 @@ async def send_fast_proxies(message, items=None, title="10 سریع‌ترین")
     lines = ["<b>⚡ " + title + "</b>", ""]
     for i, p in enumerate(g, 1):
         flag = p.get("flag", "🌐")
-        country = p.get("country") or "?"
+        country = p.get("country") or (p.get("host", "")[:18] if p.get("host") else "?")
         lines.append(
             fa(i) + ". " + flag + " " + h(country)
             + "  ·  " + fa(p["latency"]) + "ms"
