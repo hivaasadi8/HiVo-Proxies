@@ -493,6 +493,46 @@ async def send_proxy_file(message, n=None, items=None, title=None):
     STORE.add_totals(files=1, proxies=len(its))
 
 
+async def send_fast_proxies(message, items=None, title="10 سریع‌ترین"):
+    g = list(S["good"]) if items is None else list(items)
+    g = g[:10]
+    if not g:
+        await message.reply_html(
+            "<b>هنوز آماده نیست</b>\n\n"
+            "چند دقیقه دیگه امتحان کن.")
+        return
+
+    lines = ["<b>⚡ " + title + "</b>", ""]
+    for i, p in enumerate(g, 1):
+        flag = p.get("flag", "🌐")
+        country = p.get("country") or "?"
+        lines.append(
+            fa(i) + ". " + flag + " " + h(country)
+            + "  ·  " + fa(p["latency"]) + "ms"
+            + "  ·  " + stars(p.get("score", 0))
+        )
+    lines.append("")
+    lines.append("<i>روی دکمه بزن تا تلگرام پروکسی رو اضافه کنه</i>")
+
+    rows = []
+    for i in range(0, len(g), 2):
+        chunk = g[i:i + 2]
+        row = []
+        for j, p in enumerate(chunk):
+            idx = i + j + 1
+            flag = p.get("flag", "🌐")
+            label = str(idx) + ". " + flag + " " + str(p["latency"]) + "ms"
+            row.append(InlineKeyboardButton(label, url=export_uri(p)))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("◀ بازگشت", callback_data="cfg")])
+    kb = InlineKeyboardMarkup(rows)
+
+    await message.reply_html("\n".join(lines), reply_markup=kb,
+                              disable_web_page_preview=True)
+    STORE.add_totals(files=0, proxies=len(g))
+
+
 async def send_premium(message):
     prem = STORE.premium()
     if not prem:
@@ -556,7 +596,8 @@ async def run_single_test(message, uri):
     vh = res["fp"]
     pending_put(res)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 کپی لینک", copy_text=export_uri(res))],
+        [InlineKeyboardButton("🔌 اتصال", url=export_uri(res)),
+         InlineKeyboardButton("📋 کپی", copy_text=export_uri(res))],
         [InlineKeyboardButton("👍 وصل شدم", callback_data="vote:1:" + vh),
          InlineKeyboardButton("👎 نشد", callback_data="vote:0:" + vh)],
     ])
@@ -664,7 +705,6 @@ async def on_text(update, ctx):
             ADMIN_STATE.pop(uid, None)
             uris = URI_RE.findall(txt)
             if not uris:
-                # maybe just raw proxy links
                 uris = [l.strip() for l in txt.splitlines() if l.strip().startswith("http")]
             if not uris:
                 await update.message.reply_html("پروکسی‌ای پیدا نکردم.")
@@ -818,11 +858,7 @@ async def on_button(update, ctx):
     if data == "fast":
         if not await gate(update, ctx):
             return
-        fasts = list(S["good"])[:10]
-        if fasts:
-            await send_proxy_file(q.message, items=fasts, title="10 سریع‌ترین")
-        else:
-            await q.message.reply_html("هنوز چیزی نیست.")
+        await send_fast_proxies(q.message)
         return
 
     if data == "rnd":
@@ -837,7 +873,8 @@ async def on_button(update, ctx):
         p = random.choice(g)
         pending_put(p)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی", copy_text=export_uri(p))],
+            [InlineKeyboardButton("🔌 اتصال", url=export_uri(p)),
+             InlineKeyboardButton("📋 کپی", copy_text=export_uri(p))],
             [InlineKeyboardButton("👍 وصل شدم", callback_data="vote:1:" + p["fp"]),
              InlineKeyboardButton("👎 نشد", callback_data="vote:0:" + p["fp"])],
             [InlineKeyboardButton("🎲 یکی دیگه", callback_data="rnd")],
