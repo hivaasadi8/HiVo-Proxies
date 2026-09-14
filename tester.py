@@ -1,113 +1,155 @@
 # -*- coding: utf-8 -*-
-# ══════════════════════════════════════════
-#  HiVo Proxies — موتور تست ضدخرابی + انتشار فوری
-# ══════════════════════════════════════════
-import json, logging, os, re, socket, struct, threading, time
-from concurrent.futures import ThreadPoolExecutor
+# HiVo Proxies — Core Engine
+import base64, hashlib, json, logging, os, random, re, socket, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from html import unescape
+from urllib.parse import urlparse, parse_qs
 
 import requests
-from Crypto.Cipher import AES
-
 from store import STORE
 
-TCP_TIMEOUT   = 3
-MAX_TO_TEST   = 3000
-DEEP_LIMIT    = 300
-WORKERS       = 200
-DEEP_WORKERS  = 20
-DEEP_TIMEOUT  = 5
-REFRESH_EVERY = 900
+TCP_TIMEOUT = float(os.environ.get("TCP_TIMEOUT", "3"))
+MAX_TO_TEST = int(os.environ.get("MAX_TO_TEST", "5000"))
+WORKERS = int(os.environ.get("TCP_WORKERS", "200"))
+REFRESH_EVERY = int(os.environ.get("REFRESH_EVERY", "900"))
+SUB_LIMIT = int(os.environ.get("SUB_LIMIT", "500"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("hivo.proxies")
+log = logging.getLogger("hivo.core")
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-S = {"good": [], "tcp": 0, "fetched": 0, "tested": 0, "last": None}
+S = {"good": [], "tested": 0, "fetched": 0, "last": None, "sub": None}
 LOCK = threading.Lock()
 FORCE = threading.Event()
-GEO = {}
-GEO_LOCK = threading.Lock()
 
-LINK_RE = re.compile(r"(?:https?://)?t\.me/proxy\?server=([^&\s<>\"']+)&port=(\d+)&secret=([0-9a-fA-F]{16,})")
-TG_RE = re.compile(r"tg://proxy\?server=([^&\s<>\"']+)&port=(\d+)&secret=([0-9a-fA-F]{16,})")
-LINE_RE = re.compile(r"^([a-zA-Z0-9.\-]+):(\d+):([0-9a-fA-F]{32,128})\s*$", re.M)
+URI_RE = re.compile(r"(?:https?://t\.me/proxy|tg://proxy)\?[^\s\"'<>]+", re.IGNORECASE)
 
-def flag_of(cc):
-    if not cc or len(cc) != 2:
-        return "🌐"
-    return "".join(chr(ord(c) + 127397) for c in cc.upper())
+DEFAULT_SOURCES = [
+    "https://mtpro.xyz/api/?type=mtproto",
+    "https://t.me/s/MTProtoNew",
+    "https://t.me/s/mtprotoproxy",
+    "https://t.me/s/ProxyMTProto",
+    "https://t.me/s/MTPROTOPROXY_IR",
+    "https://t.me/s/proxy_mtproto",
+    "https://t.me/s/mtprotoproxy_fast",
+]
 
-def geo_batch(items):
-    hosts = list({c["server"] for c in items})
-    for i in range(0, len(hosts), 100):
-        chunk = hosts[i:i + 100]
+_GEO = {}
+_GEO_LOCK = threading.Lock()
+_SRC_HEALTH = {}
+_H_LOCK = threading.Lock()
+
+
+def parse_proxy(uri):
+    try:
+        s = uri.strip()
+        if s.startswith("tg://"):
+            s = "https://t.me/" + s[5:]
+        p = urlparse(s)
+        q = parse_qs(p.query)
+        host = q.get("server", [""])[0].strip()
         try:
-            r = requests.post("http://ip-api.com/batch?fields=status,country,countryCode,query",
-                              json=chunk, timeout=15)
-            for d in r.json():
-                if d.get("status") == "success":
-                    with GEO_LOCK:
-                        GEO[d["query"]] = (flag_of(d.get("countryCode")), d.get("country", ""))
+            port = int(q.get("port", ["0"])[0])
         except Exception:
-            continue
-    for c in items:
-        with GEO_LOCK:
-            f, name = GEO.get(c["server"], ("🌐", ""))
-        c["flag"], c["country"] = f, name
+            return None
+        secret = q.get("secret", [""])[0].strip()
+        if not host or not (0 < port < 65536) or not secret:
+            return None
+        key = host.lower() + ":" + str(port) + ":" + secret.lower()
+        fp = hashlib.sha1(key.encode()).hexdigest()[:12]
+        return {"host": host, "port": port, "secret": secret, "fp": fp, "uri": uri}
+    except Exception:
+        return None
 
-def fetch_channel(name):
-    name = str(name).strip().lstrip("@")
-    name = name.replace("https://t.me/", "").replace("t.me/", "").split("/")[0]
-    url = f"https://t.me/s/{name}"
-    text = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
-    text = text.replace("&amp;", "&")
-    out = []
-    for rx in (LINK_RE, TG_RE):
-        for m in rx.finditer(text):
-            out.append({"server": m.group(1), "port": int(m.group(2)), "secret": m.group(3).lower()})
-    return out
 
-def fetch_url(url):
-    text = requests.get(url, timeout=30).text.strip()
+def parse_json_source(text):
     out = []
     try:
         data = json.loads(text)
-        if isinstance(data, list):
-            for d in data:
-                host = d.get("host") or d.get("server") or d.get("ip")
-                sec, port = d.get("secret"), d.get("port")
-                if host and sec and port:
-                    out.append({"server": str(host), "port": int(port), "secret": str(sec).lower()})
-            return out
+        items = data if isinstance(data, list) else data.get("proxies", [])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            host = str(item.get("host") or item.get("server") or item.get("ip") or "").strip()
+            try:
+                port = int(item.get("port", 0))
+            except Exception:
+                continue
+            secret = str(item.get("secret") or "").strip()
+            if host and 0 < port < 65536 and secret:
+                out.append("https://t.me/proxy?server=" + host + "&port=" + str(port) + "&secret=" + secret)
     except Exception:
         pass
-    text = text.replace("&amp;", "&")
-    for rx in (LINK_RE, TG_RE):
-        for m in rx.finditer(text):
-            out.append({"server": m.group(1), "port": int(m.group(2)), "secret": m.group(3).lower()})
-    for m in LINE_RE.finditer(text):
-        out.append({"server": m.group(1), "port": int(m.group(2)), "secret": m.group(3).lower()})
     return out
 
-def gather():
-    src = STORE.data["sources"]
-    items = []
-    for url in src["urls"]:
-        try:
-            items += fetch_url(url)
-        except Exception as e:
-            log.warning(f"url err: {e}")
-    for ch in src["channels"]:
-        try:
-            items += fetch_channel(ch)
-        except Exception as e:
-            log.warning(f"channel err: {ch} → {e}")
-    uniq = {}
-    for p in items:
-        k = (p["server"], p["port"])
-        if k not in uniq:
-            uniq[k] = p
-    return list(uniq.values())
+
+def fetch_source(url):
+    r = requests.get(url, timeout=25, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; HiVo-Proxies/1.0)"})
+    r.raise_for_status()
+    text = r.text
+    stripped = text.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        res = parse_json_source(stripped)
+        if res:
+            return res
+    text = unescape(text)
+    return URI_RE.findall(text)
+
+
+def _safe_fetch(url):
+    with _H_LOCK:
+        h = _SRC_HEALTH.setdefault(url, {"ok": 0, "fail": 0, "count": 0, "cooldown": 0})
+        if h["cooldown"] > time.time():
+            return None
+    try:
+        res = fetch_source(url)
+        with _H_LOCK:
+            h["ok"] += 1
+            h["fail"] = 0
+            h["count"] = len(res)
+        return res
+    except Exception as e:
+        with _H_LOCK:
+            h["fail"] += 1
+            if h["fail"] >= 3:
+                h["cooldown"] = time.time() + 1800
+        log.warning("src fail: " + str(e))
+        return None
+
+
+def current_sources():
+    srcs = STORE.data.get("sources")
+    if isinstance(srcs, list) and srcs:
+        return list(srcs)
+    return list(DEFAULT_SOURCES)
+
+
+def fetch_all():
+    out = []
+    with ThreadPoolExecutor(8) as pool:
+        for res in pool.map(_safe_fetch, current_sources()):
+            if res:
+                out += res
+    return out
+
+
+def source_report():
+    out = []
+    with _H_LOCK:
+        snap = {u: dict(h) for u, h in _SRC_HEALTH.items()}
+    for u in current_sources():
+        h = snap.get(u, {})
+        out.append({
+            "url": u,
+            "ok": h.get("ok", 0),
+            "fail": h.get("fail", 0),
+            "count": h.get("count", 0),
+            "cooldown": max(0, int(h.get("cooldown", 0) - time.time())),
+        })
+    return out
+
 
 def tcp_ping(host, port):
     try:
@@ -117,108 +159,185 @@ def tcp_ping(host, port):
     except Exception:
         return None
 
-def tcp_one(p):
-    ms = tcp_ping(p["server"], p["port"])
+
+def probe(p):
+    ms = tcp_ping(p["host"], p["port"])
     if ms is None:
         return None
-    return {**p, "latency": ms, "flag": "🌐", "country": "", "deep": False}
+    p["latency"] = ms
+    return p
 
-def deep_check(host, port, secret_hex):
-    try:
-        secret = bytes.fromhex(secret_hex)
-    except Exception:
-        return None
-    if not secret or len(secret) < 16:
-        return None
-    if secret[:1] == b"\xEE":
-        return None
-    if secret[:1] == b"\xDD":
-        secret = secret[1:]
-    secret = secret[:16]
-    init = bytearray(os.urandom(64))
-    init[0:16] = secret
-    init[56:60] = b"\xEF\xEF\xEF\xEF"
-    c2s = AES.new(bytes(init[8:40]), AES.MODE_CTR, nonce=b"", initial_value=bytes(init[40:56]))
-    rev = bytes(init[8:56])[::-1]
-    s2c = AES.new(rev[:32], AES.MODE_CTR, nonce=b"", initial_value=rev[32:48])
-    try:
-        s = socket.create_connection((host, port), timeout=DEEP_TIMEOUT)
-        s.settimeout(DEEP_TIMEOUT)
-        s.sendall(bytes(init[:56]) + c2s.encrypt(bytes(init[56:])))
-        t0 = time.monotonic()
-        nonce = os.urandom(16)
-        inner = b"\x87\x07\x46\x60" + nonce
-        msg_id = struct.pack("<q", (int(time.time()) << 32) | 1)
-        plain = b"\x00" * 8 + msg_id + struct.pack("<I", len(inner)) + inner
-        frame = b"\xEF" + bytes([len(plain)])
-        s.sendall(c2s.encrypt(frame))
-        buf = b""
-        while time.monotonic() - t0 < DEEP_TIMEOUT and len(buf) < 1024:
-            try:
-                chunk = s.recv(512)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buf += s2c.decrypt(chunk)
-            if b"\x63\x24\x16\x05" in buf:
-                ms = round((time.monotonic() - t0) * 1000)
-                s.close()
-                return ms
-        s.close()
-    except Exception:
-        return None
-    return None
 
-def deep_one(c):
-    ms = deep_check(c["server"], c["port"], c["secret"])
-    if ms is None:
-        return None
-    return {**c, "latency": ms, "deep": True}
+def flag_of(cc):
+    if not cc or len(cc) != 2:
+        return "🌐"
+    return "".join(chr(ord(c) + 127397) for c in cc.upper())
+
+
+def geo_batch(items):
+    todo = sorted({p["host"] for p in items if p.get("host") and p["host"] not in _GEO})[:100]
+    if not todo:
+        return
+    try:
+        r = requests.post(
+            "http://ip-api.com/batch?fields=status,country,countryCode,city,query",
+            json=todo, timeout=12)
+        for d in r.json():
+            if d.get("status") == "success":
+                with _GEO_LOCK:
+                    _GEO[d["query"]] = (flag_of(d.get("countryCode")),
+                                        d.get("country", ""),
+                                        d.get("city", ""))
+    except Exception:
+        pass
+    for p in items:
+        with _GEO_LOCK:
+            f, n, c = _GEO.get(p["host"], ("🌐", "", ""))
+        p["flag"] = f
+        p["country"] = n
+        p["city"] = c
+
+
+def score_of(p):
+    ms = p.get("latency", 9999)
+    if ms < 100:
+        return 100
+    if ms < 300:
+        return 95
+    if ms < 600:
+        return 85
+    if ms < 1000:
+        return 70
+    if ms < 2000:
+        return 50
+    return 30
+
+
+def dedup(items):
+    best = {}
+    for p in items:
+        fp = p.get("fp")
+        if not fp:
+            continue
+        cur = best.get(fp)
+        if cur is None or p.get("latency", 9999) < cur.get("latency", 9999):
+            best[fp] = p
+    return list(best.values())
+
 
 def publish(items):
-    items = sorted(items, key=lambda c: c["latency"])
+    alive = [p for p in dedup(items) if p.get("latency") is not None]
+    if not alive:
+        return
+    for p in alive:
+        p["score"] = score_of(p)
+    alive.sort(key=lambda p: p["latency"])
     with LOCK:
-        S["good"] = items
+        S["good"] = alive
         S["last"] = datetime.now()
 
+
+def export_uri(p):
+    return ("https://t.me/proxy?server=" + p["host"]
+            + "&port=" + str(p["port"])
+            + "&secret=" + p["secret"])
+
+
+def upload_sub(text):
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not token or not repo:
+        return None
+    api = "https://api.github.com/repos/" + repo + "/contents/proxies.txt"
+    headers = {"Authorization": "Bearer " + token,
+               "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(api, headers=headers, timeout=30)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+        body = {"message": "update proxies",
+                "content": base64.b64encode(text.encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        r2 = requests.put(api, headers=headers, json=body, timeout=30)
+        if r2.status_code in (200, 201):
+            return "https://raw.githubusercontent.com/" + repo + "/main/proxies.txt"
+    except Exception as e:
+        log.warning("sub up: " + str(e))
+    return None
+
+
+def cycle(n_max, label):
+    uris = fetch_all()
+    uniq = list(dict.fromkeys(uris))
+    random.shuffle(uniq)
+    with LOCK:
+        S["fetched"] = len(uniq)
+        S["tested"] = 0
+
+    seen, parsed = set(), []
+    for u in uniq:
+        if len(parsed) >= n_max:
+            break
+        p = parse_proxy(u)
+        if not p or p["fp"] in seen:
+            continue
+        seen.add(p["fp"])
+        parsed.append(p)
+
+    total = len(parsed)
+    log.info("[" + label + "] candidates: " + str(total))
+
+    alive = []
+    done = 0
+    with ThreadPoolExecutor(WORKERS) as pool:
+        futs = [pool.submit(probe, p) for p in parsed]
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                alive.append(r)
+            done += 1
+            if done % 100 == 0:
+                with LOCK:
+                    S["tested"] = done
+                publish(alive)
+        with LOCK:
+            S["tested"] = done
+
+    geo_batch(alive)
+    publish(alive)
+    log.info("[" + label + "] alive: " + str(len(S["good"])))
+
+    try:
+        with LOCK:
+            good = list(S["good"][:SUB_LIMIT])
+        if good:
+            text = "\n".join(export_uri(p) for p in good) + "\n"
+            url = upload_sub(text)
+            with LOCK:
+                S["sub"] = url
+    except Exception:
+        log.exception("sub")
+
+
 def refresh_loop():
-    log.info("refresh loop started")
+    log.info("engine started")
     while True:
         try:
-            items = gather()
-            with LOCK:
-                S["fetched"] = len(items)
-            log.info(f"gathered: {len(items)}")
-            batch = items[:MAX_TO_TEST]
-            tcp = []
-            with ThreadPoolExecutor(WORKERS) as pool:
-                for r in pool.map(tcp_one, batch):
-                    if r:
-                        tcp.append(r)
-            tcp.sort(key=lambda c: c["latency"])
-            with LOCK:
-                S["tcp"] = len(tcp)
-                S["tested"] = len(batch)
-            log.info(f"tcp alive: {len(tcp)}")
-            geo_batch(tcp[:100])
-            publish(tcp)
-            cands = [c for c in tcp if not c["secret"].startswith("ee")][:DEEP_LIMIT]
-            deep_ok = []
-            if cands:
-                log.info(f"deep: {len(cands)}")
-                with ThreadPoolExecutor(DEEP_WORKERS) as pool:
-                    for r in pool.map(deep_one, cands):
-                        if r:
-                            deep_ok.append(r)
-            deep_ok.sort(key=lambda c: c["latency"])
-            keys = {(c["server"], c["port"]) for c in deep_ok}
-            rest = [c for c in tcp if (c["server"], c["port"]) not in keys][:200]
-            final = deep_ok + rest
-            geo_batch(final)
-            publish(final)
-            log.info(f"final: {len(final)} (deep {len(deep_ok)})")
-        except Exception as e:
-            log.exception(f"cycle error: {e}")
+            cycle(MAX_TO_TEST, "full")
+        except Exception:
+            log.exception("cycle")
         FORCE.wait(REFRESH_EVERY)
         FORCE.clear()
+
+
+def test_single(uri):
+    p = parse_proxy(uri)
+    if not p:
+        return None
+    ms = tcp_ping(p["host"], p["port"])
+    if ms is None:
+        return None
+    p["latency"] = ms
+    p["score"] = score_of(p)
+    geo_batch([p])
+    return p
