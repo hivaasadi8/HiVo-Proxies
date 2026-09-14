@@ -1,4 +1,4 @@
-name: HiVo Proxies
+name: HiVo Proxies Bot
 
 on:
   schedule:
@@ -9,20 +9,49 @@ permissions:
   contents: write
 
 concurrency:
-  group: bot
-  cancel-in-progress: true
+  group: hivo-proxies
+  cancel-in-progress: false
 
 jobs:
   bot:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: python main.py
+          cache: "pip"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run bot (auto-restart)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          MAX_TO_TEST: "5000"
+          TCP_TIMEOUT: "3"
+          TCP_WORKERS: "200"
+          REFRESH_EVERY: "900"
+        run: |
+          end=$((SECONDS + 330*60))
+          n=0
+          while [ $SECONDS -lt $end ]; do
+            n=$((n+1))
+            remain=$((end - SECONDS))
+            echo "=== run #$n | remaining ${remain}s ==="
+            timeout "$remain" python main.py
+            code=$?
+            if [ $code -eq 124 ]; then
+              echo "time budget reached"
+              break
+            fi
+            echo "exited $code — restart in 5s"
+            sleep 5
+          done
